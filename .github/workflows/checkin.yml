@@ -1,46 +1,40 @@
 name: Ayrouter Daily Check-in
-
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 0 * * *'
   # 支持手动触发
   workflow_dispatch:
-
 permissions:
   actions: write
   contents: read
-
 jobs:
   checkin:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       # ---------- 检出代码 ----------
       - name: Checkout repository
         uses: actions/checkout@v6
-
       # ---------- 安装 Python ----------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       # ---------- 安装 Python 依赖 和 Playwright 浏览器  ----------
       - name: Install Python dependencies
         run: |
           pip install requests playwright pynacl
           playwright install --with-deps chromium
-
       # ---------- 运行领币脚本 ----------
       - name: Run check-in script
         env:
           USER_ID: ${{ secrets.USER_ID }}
           SESSION: ${{ secrets.SESSION }}
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python app.py
-        
+
       - name: 🧹 clear old run jobs
         if: always()
         env:
