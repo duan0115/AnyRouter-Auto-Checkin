@@ -12,8 +12,27 @@ from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
 # 环境变量配置(私库可直接在双引号内填写,session建议填写secrets,需要自动更新)
+# --- 多账号模式 ---
+# 设置 ACCOUNTS 环境变量即可启用多账号，支持两种写法（任选其一）：
+#
+# 写法一（推荐，纯文本，避免 JSON 转义麻烦）：每行一个账号，用冒号分隔
+#   USER_ID:SESSION:SECRET_NAME
+#   SECRET_NAME 可省略，省略时自动使用 SESSION_1 / SESSION_2 ... 作为该账号
+#   Session 过期后自动更新的 GitHub Secret 名称。示例：
+#
+#   ACCOUNTS = """
+#   123456:xxxxxxxxxxxxxxxxxxxxx:SESSION_1
+#   234567:yyyyyyyyyyyyyyyyyyyyy:SESSION_2
+#   """
+#
+# 写法二：JSON 数组
+#   ACCOUNTS = [{"user_id":"123456","session":"xxx","secret_name":"SESSION_1"},
+#               {"user_id":"234567","session":"yyy","secret_name":"SESSION_2"}]
+#
+# --- 单账号模式（兼容旧配置，不设置 ACCOUNTS 时生效）---
 USER_ID      = os.getenv("USER_ID") or ""  # 用户ID,必填,登录后右上角个人设置里进去就看到ID了,一般是6位数
 SESSION      = os.getenv("SESSION") or ""  # session必填,登录后F12或右键检查菜单进去,选择应用程序或Appcations栏,找到cookie,右边找到session的值
+ACCOUNTS_RAW = os.getenv("ACCOUNTS") or ""  # 多账号配置，见上方说明
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or ""  # Telegram bot token,不需要通知可以留空
 TG_CHAT_ID   = os.getenv("TG_CHAT_ID") or ""    # Telegram chat id
 
@@ -86,6 +105,57 @@ def check_session_expiry(session_value: str):
         log("WARN", f"Session 剩余 {remaining_days:.2f} 天 < {SESSION_THRESHOLD_DAYS} 天，需要更新！")
 
     return remaining_days, need_update
+
+def parse_accounts() -> list[dict]:
+    """
+    解析多账号配置。优先读取 ACCOUNTS 环境变量，
+    支持 "USER_ID:SESSION:SECRET_NAME" 逐行格式，也支持 JSON 数组格式。
+    未设置 ACCOUNTS 时，退化为单账号模式（读取 USER_ID / SESSION）。
+
+    返回: [{"user_id": str, "session": str, "secret_name": str}, ...]
+    """
+    accounts: list[dict] = []
+
+    raw = ACCOUNTS_RAW.strip()
+    if raw:
+        # 尝试 JSON 数组格式
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                for idx, item in enumerate(parsed, start=1):
+                    uid = str(item.get("user_id", "")).strip()
+                    sess = str(item.get("session", "")).strip()
+                    secret_name = str(item.get("secret_name") or f"SESSION_{idx}").strip()
+                    if uid and sess:
+                        accounts.append({"user_id": uid, "session": sess, "secret_name": secret_name})
+                if accounts:
+                    return accounts
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        # 逐行 "USER_ID:SESSION:SECRET_NAME" 格式
+        for idx, line in enumerate(raw.splitlines(), start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(":")]
+            if len(parts) < 2:
+                log("WARN", f"ACCOUNTS 第 {idx} 行格式不正确，已跳过: {line}")
+                continue
+            uid, sess = parts[0], parts[1]
+            secret_name = parts[2] if len(parts) >= 3 and parts[2] else f"SESSION_{idx}"
+            if uid and sess:
+                accounts.append({"user_id": uid, "session": sess, "secret_name": secret_name})
+
+        if accounts:
+            return accounts
+        log("WARN", "ACCOUNTS 环境变量已设置但未解析出有效账号，回退到单账号模式")
+
+    # 单账号模式（兼容旧配置）
+    if USER_ID and SESSION:
+        accounts.append({"user_id": USER_ID, "session": SESSION, "secret_name": "SESSION"})
+
+    return accounts
 
 def update_github_secret(secret_name: str, new_value: str) -> bool:
     """通过 gh CLI 更新 GitHub Actions Secret"""
@@ -189,7 +259,7 @@ def get_waf_cookies() -> dict:
     return waf_cookies
 
 # API 调用
-def build_headers() -> dict:
+def build_headers(user_id: str) -> dict:
     """构建 API 请求头"""
     return {
         "User-Agent": (
@@ -205,7 +275,7 @@ def build_headers() -> dict:
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
-        "new-api-user": USER_ID,
+        "new-api-user": user_id,
     }
 
 def get_user_info(session: requests.Session, headers: dict) -> dict | None:
@@ -294,51 +364,47 @@ def format_balance(quota: int) -> str:
     return f"{balance:.2f}$"
 
 # 主流程
-def run_checkin():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def run_checkin_for_account(account: dict, waf_cookies: dict, now_str: str) -> str:
+    """
+    对单个账号执行完整的签到流程，返回该账号在汇总 Telegram 消息中的一段文本。
+    出错时不抛异常中断整体流程，而是返回错误说明，方便多账号互不影响。
+    """
+    user_id = account["user_id"]
+    session_value = account["session"]
+    secret_name = account["secret_name"]
 
-    log("INFO", "=" * 50)
-    log("INFO", "Anyrouter 领币脚本启动")
-    log("INFO", f"时间: {now_str}")
-    log("INFO", f"用户 ID: {USER_ID}")
-    log("INFO", "=" * 50)
+    log("INFO", "-" * 50)
+    log("INFO", f"开始处理账号 用户 ID: {user_id} (Secret: {secret_name})")
 
-    if not SESSION:
-        log("ERROR", "SESSION 未配置，请设置 SESSION 环境变量")
-        sys.exit(1)
+    if not session_value:
+        log("ERROR", f"账号 {user_id} 的 SESSION 未配置")
+        return f"❌ 账户 {user_id}：SESSION 未配置\n"
 
-    # ---------- Step 1: 获取 WAF Cookie ----------
-    waf_cookies = get_waf_cookies()
+    # ---------- 构建 HTTP Session ----------
+    http_session = requests.Session()
 
-    # ---------- Step 2: 构建 HTTP Session ----------
-    session = requests.Session()
-
-    # 设置所有 Cookie: WAF Cookie + Session Cookie + user_id
     all_cookies = {}
     all_cookies.update(waf_cookies)
-    all_cookies["session"] = SESSION
-    all_cookies["user_id"] = USER_ID
+    all_cookies["session"] = session_value
+    all_cookies["user_id"] = user_id
 
     for name, value in all_cookies.items():
-        session.cookies.set(name, value, domain="anyrouter.top", path="/")
+        http_session.cookies.set(name, value, domain="anyrouter.top", path="/")
 
     log("INFO", f"已设置 {len(all_cookies)} 个 Cookie: {list(all_cookies.keys())}")
 
-    headers = build_headers()
+    headers = build_headers(user_id)
 
-    # ---------- Step 3: 验证登录状态并获取初始余额 ----------
+    # ---------- 验证登录状态并获取初始余额 ----------
     log("INFO", "通过 API 验证登录状态...")
-    user_info_1 = get_user_info(session, headers)
+    user_info_1 = get_user_info(http_session, headers)
 
     if not user_info_1:
-        log("ERROR", "API 验证失败，Session 可能已过期")
-        send_telegram(
-            f"❌ <b>Anyrouter 登录失败</b>\n"
-            f"👤 账户: {USER_ID}\n"
-            f"⏱️ 时间: {now_str}\n"
-            f"📝 原因: Session 已过期，请尽快更新 SESSION"
+        log("ERROR", f"账号 {user_id} API 验证失败，Session 可能已过期")
+        return (
+            f"❌ <b>账户 {user_id} 登录失败</b>\n"
+            f"📝 原因: Session 已过期，请尽快更新 {secret_name}\n"
         )
-        sys.exit(1)
 
     log("INFO", "✅ 登录成功！（API 验证通过）")
     username = user_info_1.get("username", "")
@@ -348,35 +414,33 @@ def run_checkin():
     log("INFO", f"初始余额: {first_balance}")
     log("INFO", f"API Quota: {user_info_1.get('quota')}, Used: {user_info_1.get('used_quota')}")
 
-    # ---------- Step 4: 签到领币 ----------
+    # ---------- 签到领币 ----------
     log("INFO", "执行签到领币...")
-    checkin_success = do_check_in(session, headers)
+    do_check_in(http_session, headers)
 
-    # ---------- Step 5: 等待 3 秒后重新获取余额 ----------
+    # ---------- 等待后重新获取余额 ----------
     log("INFO", "等待 3 秒后重新获取余额...")
     time.sleep(3)
 
-    user_info_2 = get_user_info(session, headers)
+    user_info_2 = get_user_info(http_session, headers)
     second_balance = format_balance(user_info_2.get("quota", 0)) if user_info_2 else "N/A"
     log("INFO", f"刷新后余额: {second_balance}")
     if user_info_2:
         log("INFO", f"API Quota: {user_info_2.get('quota')}, Used: {user_info_2.get('used_quota')}")
 
-    # ---------- Step 6: 检查余额变化 ----------
     balance_changed = first_balance != second_balance
     if balance_changed:
         log("INFO", f"✅ 余额发生变化: {first_balance} → {second_balance}")
     else:
         log("INFO", f"余额未变化: {first_balance}")
 
-    # ---------- Step 7: 检查 Session 有效期 ----------
-    remaining_days, need_update = check_session_expiry(SESSION)
+    # ---------- 检查 Session 有效期 ----------
+    remaining_days, need_update = check_session_expiry(session_value)
 
-    # ---------- Step 8: 若 Session 即将过期，更新 GitHub Secret ----------
     session_status = ""
     if need_update:
-        log("WARN", "Session 即将过期，尝试更新 GitHub Secret...")
-        success = update_github_secret("SESSION", SESSION)
+        log("WARN", f"账号 {user_id} 的 Session 即将过期，尝试更新 GitHub Secret {secret_name}...")
+        success = update_github_secret(secret_name, session_value)
         if success:
             session_status = f"✅ Session 已自动更新（剩余 {remaining_days:.1f} 天）" if remaining_days else "✅ Session 已自动更新"
         else:
@@ -387,15 +451,48 @@ def run_checkin():
         else:
             session_status = "⚠️ Session 有效期未知"
 
-    # ---------- Step 9: 发送 Telegram 通知 ----------
-    message = (
-        f"🎁 <b>Anyrouter 签到通知</b>\n\n"
-        f"👤 登录账户: {USER_ID}\n"
-        f"💰 昨日余额: {first_balance}\n"
-        f"💰 当前余额: {second_balance}\n"
-        f"⏱️ 登录时间: {now_str}\n"
-        f"📋 {session_status}"
+    return (
+        f"👤 账户: {user_id}" + (f" ({username})" if username else "") + "\n"
+        f"💰 签到前: {first_balance}  →  签到后: {second_balance}\n"
+        f"📋 {session_status}\n"
     )
+
+def run_checkin():
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    accounts = parse_accounts()
+
+    log("INFO", "=" * 50)
+    log("INFO", "Anyrouter 领币脚本启动")
+    log("INFO", f"时间: {now_str}")
+    log("INFO", f"账号数量: {len(accounts)}")
+    log("INFO", "=" * 50)
+
+    if not accounts:
+        log("ERROR", "未配置任何账号，请设置 ACCOUNTS（多账号）或 USER_ID / SESSION（单账号）")
+        send_telegram(
+            f"❌ <b>Anyrouter 脚本配置错误</b>\n"
+            f"⏱️ 时间: {now_str}\n"
+            f"📝 原因: 未配置任何账号，请检查 ACCOUNTS 或 USER_ID / SESSION"
+        )
+        sys.exit(1)
+
+    # ---------- 获取 WAF Cookie（所有账号共用，只需获取一次） ----------
+    waf_cookies = get_waf_cookies()
+
+    sections = []
+    for account in accounts:
+        try:
+            sections.append(run_checkin_for_account(account, waf_cookies, now_str))
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            log("ERROR", f"账号 {account.get('user_id')} 处理异常: {error_msg}")
+            log("ERROR", traceback.format_exc())
+            sections.append(f"❌ 账户 {account.get('user_id')} 处理异常: {error_msg}\n")
+
+    # ---------- 发送汇总 Telegram 通知 ----------
+    header = "🎁 <b>Anyrouter 签到通知</b>" if len(accounts) == 1 else f"🎁 <b>Anyrouter 签到通知</b>（共 {len(accounts)} 个账号）"
+    message = header + f"\n⏱️ 时间: {now_str}\n\n" + "\n".join(sections)
 
     send_telegram(message)
 
@@ -413,7 +510,6 @@ def main():
         log("ERROR", traceback.format_exc())
         send_telegram(
             f"❌ <b>Anyrouter 脚本异常</b>\n"
-            f"👤 账户: {USER_ID}\n"
             f"⏱️ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"📝 错误: {error_msg}"
         )
