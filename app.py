@@ -37,6 +37,7 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or ""  # Telegram bot token,不需要�
 TG_CHAT_ID   = os.getenv("TG_CHAT_ID") or ""    # Telegram chat id
 
 SITE_URL = "https://anyrouter.top"
+BEIJING_TZ = timezone(timedelta(hours=8))  # 固定使用北京时间，不依赖服务器所在时区
 SESSION_TTL_DAYS = 30  # Session 有效期 30 天，剩余 < 3 天则更新
 SESSION_THRESHOLD_DAYS = 3
 QUOTA_PER_DOLLAR = 500000 
@@ -44,8 +45,8 @@ WAF_COOKIE_NAMES = ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
 
 # 工具函数
 def log(level: str, msg: str):
-    """带时间戳的日志输出"""
-    ts = datetime.now().strftime("%H:%M:%S")
+    """带时间戳的日志输出（固定使用北京时间）"""
+    ts = datetime.now(BEIJING_TZ).strftime("%H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
 def decode_session_timestamp(session_value: str) -> int | None:
@@ -93,8 +94,8 @@ def check_session_expiry(session_value: str):
     remaining = expiry_time - now
     remaining_days = remaining.total_seconds() / 86400
 
-    created_local = created_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    expiry_local = expiry_time.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    created_local = created_time.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    expiry_local = expiry_time.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     log("INFO", f"Session 创建时间: {created_local}")
     log("INFO", f"Session 过期时间: {expiry_local}")
@@ -458,7 +459,7 @@ def run_checkin_for_account(account: dict, waf_cookies: dict, now_str: str) -> s
     )
 
 def run_checkin():
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     accounts = parse_accounts()
 
@@ -510,7 +511,7 @@ def main():
         log("ERROR", traceback.format_exc())
         send_telegram(
             f"❌ <b>Anyrouter 脚本异常</b>\n"
-            f"⏱️ 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"⏱️ 时间: {datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"📝 错误: {error_msg}"
         )
         sys.exit(1)
