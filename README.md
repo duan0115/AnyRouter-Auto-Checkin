@@ -9,7 +9,7 @@
 | Secret 名称         | 是否必填 | 说明                                              |
 |---------------------|----------|---------------------------------------------------|
 | USER_ID            | ✅ 必填  | 用户ID,登录后右上角个人设置里进去就看到ID了,一般是6位数      |
-| SESSION            | ✅ 必填  | SESSION 在cookie里获取，获取方式见下图                  |
+| SESSION            | ✅ 必填  | SESSION 在cookie里获取，获取方式见下图，30天手动更新一下secret|
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                     |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）             |
 
